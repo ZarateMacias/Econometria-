@@ -1,0 +1,195 @@
+---
+title: "Predicción de la Tasa de Desempleo con Google Trends"
+format: html
+editor: visual
+---
+
+## Cargar Librerías
+
+```{r}
+#| code-fold: true
+library(forecast)
+library(tseries)
+library(gtrendsR)
+```
+
+## Cargar Datos
+
+Descargamos el índice de búsqueda de "bolsa de trabajo" en México desde Google Trends, y cargamos la tasa de desempleo del INEGI.
+
+```{r}
+#| code-fold: true
+
+# Descargar Google Trends
+trends_raw <- gtrends(
+  keyword = "bolsa de trabajo",
+  geo     = "MX",
+  time    = "2010-01-01 2024-12-31"
+)
+
+trends_df <- trends_raw$interest_over_time
+trends_df$hits <- as.numeric(trends_df$hits)
+trends_df$hits[is.na(trends_df$hits)] <- 0
+
+head(trends_df)
+```
+
+```{r}
+#| code-fold: true
+# Cargar tasa de desempleo desde CSV (exportado del INEGI)
+# desempleo_df <- read.csv("tasa_desempleo.csv")
+
+# Serie de ejemplo mientras se integran los datos reales del INEGI:
+desempleo_df <- data.frame(
+  fecha          = seq(as.Date("2010-01-01"), as.Date("2024-12-01"), by = "month"),
+  tasa_desempleo = 4.2 + sin(seq(0, 10*pi, length.out = 180)) + rnorm(180, 0, 0.2)
+)
+
+head(desempleo_df)
+```
+
+## Crear Series de Tiempo
+
+```{r}
+#| code-fold: true
+desempleo_ts <- ts(
+  data      = desempleo_df$tasa_desempleo,
+  start     = c(2010, 1),
+  frequency = 12
+)
+
+google_ts <- ts(
+  data      = trends_df$hits,
+  start     = c(2010, 1),
+  frequency = 12
+)
+
+plot(desempleo_ts, main = "Tasa de Desempleo (%)", xlab = "Año", ylab = "%")
+plot(google_ts, main = "Google Trends: 'bolsa de trabajo'", xlab = "Año", ylab = "Índice")
+```
+
+## Transformación Logarítmica
+
+```{r}
+#| code-fold: true
+log_desempleo_ts <- log(desempleo_ts)
+
+plot(desempleo_ts, main = "Tasa de Desempleo – Niveles")
+plot(log_desempleo_ts, main = "Log(Tasa de Desempleo)")
+```
+
+## Prueba de Estacionariedad
+
+```{r}
+#| code-fold: true
+adf.test(log_desempleo_ts)
+```
+
+```{r}
+#| code-fold: true
+diff_log_desempleo_ts <- diff(log_desempleo_ts)
+plot(diff_log_desempleo_ts, main = "Diff(Log(Tasa de Desempleo))")
+adf.test(diff_log_desempleo_ts)
+```
+
+## ACF y PACF
+
+```{r}
+#| code-fold: true
+acf(diff_log_desempleo_ts, main = "ACF – Diff(Log(Desempleo))")
+pacf(diff_log_desempleo_ts, main = "PACF – Diff(Log(Desempleo))")
+```
+
+## Modelo ARIMA (benchmark)
+
+```{r}
+#| code-fold: true
+modelo_arima <- auto.arima(log_desempleo_ts, seasonal = TRUE)
+summary(modelo_arima)
+plot(residuals(modelo_arima), main = "Residuos – ARIMA")
+```
+
+## Modelo ARIMAX con Google Trends
+
+Agregamos el índice de Google Trends como variable exógena (ARIMAX).
+
+```{r}
+#| code-fold: true
+X_exog <- as.matrix(google_ts)
+
+modelo_arimax <- auto.arima(log_desempleo_ts, xreg = X_exog, seasonal = TRUE)
+summary(modelo_arimax)
+plot(residuals(modelo_arimax), main = "Residuos – ARIMAX (Google Trends)")
+```
+
+## Selección de Modelo por AIC
+
+```{r}
+#| code-fold: true
+data.frame(
+  Modelo = c("ARIMA", "ARIMAX"),
+  AIC    = c(AIC(modelo_arima), AIC(modelo_arimax)),
+  BIC    = c(BIC(modelo_arima), BIC(modelo_arimax))
+)
+```
+
+## Diagnóstico de Residuos
+
+```{r}
+#| code-fold: true
+checkresiduals(modelo_arimax)
+```
+
+```{r}
+#| code-fold: true
+shapiro.test(as.numeric(residuals(modelo_arimax)))
+```
+
+## Pronóstico a 12 meses
+
+```{r}
+#| code-fold: true
+# Proyectamos Google Trends como el promedio de los últimos 12 meses
+X_future <- matrix(rep(mean(tail(as.numeric(google_ts), 12)), 12), ncol = 1)
+
+fc <- forecast(modelo_arimax, h = 12, xreg = X_future)
+fc
+```
+
+```{r}
+#| code-fold: true
+# Revertimos la transformación logarítmica
+pred_nivel    <- exp(as.numeric(fc$mean))
+lower_95      <- exp(as.numeric(fc$lower[, 2]))
+upper_95      <- exp(as.numeric(fc$upper[, 2]))
+
+pred_nivel
+```
+
+## Gráfica del Pronóstico con Intervalos de Confianza
+
+```{r}
+#| code-fold: true
+ultimas <- tail(as.numeric(desempleo_ts), 36)
+x_obs  <- 1:36
+x_pred <- 37:48
+
+plot(x_obs, ultimas,
+     type = "l", lwd = 2, col = "steelblue",
+     xlim = c(1, 48),
+     ylim = range(c(ultimas, lower_95, upper_95)),
+     main = "Pronóstico Tasa de Desempleo – ARIMAX",
+     xlab = "Meses", ylab = "Tasa (%)")
+
+polygon(c(x_pred, rev(x_pred)),
+        c(lower_95, rev(upper_95)),
+        col = rgb(0, 0, 0, 0.2), border = NA)
+
+lines(x_pred, pred_nivel, lwd = 2, col = "tomato")
+abline(v = 36.5, lty = 2, col = "gray50")
+
+legend("topleft",
+       legend = c("Observado", "Pronóstico", "IC 95%"),
+       col    = c("steelblue", "tomato", rgb(0, 0, 0, 0.3)),
+       lwd    = c(2, 2, 8), bty = "n")
+```

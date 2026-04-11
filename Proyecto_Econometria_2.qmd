@@ -1,0 +1,541 @@
+---
+title: "Salario Mínimo e Inflación en Alimentos en México (2010–2026)"
+format: html
+editor: visual
+---
+
+## Cargar Librerías
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+library(siebanxicor)   # Descarga de datos de Banxico
+library(tseries)       # Prueba ADF
+library(urca)          # Prueba Zivot-Andrews
+library(vars)          # Modelos VAR y Causalidad de Granger
+library(rugarch)       # Modelos ARCH y GARCH
+library(FinTS)         # Prueba ARCH (ArchTest)
+library(ggplot2)       # Gráficas
+library(gridExtra)     # Múltiples gráficas
+library(dplyr)         # Manipulación de datos
+library(scales)        # Formato de ejes
+```
+
+## Descargar Datos desde Banxico
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+setToken("85d801ef808da540dd530f051c3ccbb8dbeb1995ca3ce8a276167c28cd3d0f42")
+
+# Salario mínimo general diario (pesos corrientes) — Serie SL11298
+sal_raw <- getSeriesData("SL11298", "2010-01-01", "2026-03-31")
+
+# Subíndice de inflación en alimentos (variación anual) — Serie SP74661
+ali_raw <- getSeriesData("SP74661", "2010-01-01", "2026-03-31")
+
+cat("Descarga completada correctamente.\n")
+```
+
+## Preparar y Limpiar los Datos
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Las columnas de siebanxicor se llaman $date y $value
+sal_df <- data.frame(
+  fecha   = as.Date(sal_raw$SL11298$date),
+  salario = as.numeric(sal_raw$SL11298$value)
+)
+
+ali_df <- data.frame(
+  fecha     = as.Date(ali_raw$SP74661$date),
+  inflacion = as.numeric(ali_raw$SP74661$value)
+)
+
+# Unir por fecha y limpiar
+datos <- inner_join(sal_df, ali_df, by = "fecha") %>%
+  arrange(fecha) %>%
+  filter(!is.na(salario), !is.na(inflacion),
+         salario > 0, inflacion > 0)
+
+cat("Rango de fechas:", format(min(datos$fecha)), "a", format(max(datos$fecha)), "\n")
+cat("Número de observaciones:", nrow(datos), "\n\n")
+head(datos)
+```
+
+## Crear Series de Tiempo
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+inicio <- c(as.integer(format(min(datos$fecha), "%Y")),
+            as.integer(format(min(datos$fecha), "%m")))
+
+salario_ts   <- ts(datos$salario,   start = inicio, frequency = 12)
+inflacion_ts <- ts(datos$inflacion, start = inicio, frequency = 12)
+
+# ── Gráficas de niveles ──────────────────────────────────────────────────────
+df_plot <- data.frame(fecha = datos$fecha,
+                      salario = datos$salario,
+                      inflacion = datos$inflacion)
+
+p1 <- ggplot(df_plot, aes(x = fecha, y = salario)) +
+  geom_line(color = "#2171b5", linewidth = 0.9) +
+  geom_area(fill = "#2171b5", alpha = 0.1) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  scale_y_continuous(labels = dollar_format(prefix = "$", suffix = "")) +
+  labs(title = "Salario Mínimo Diario en México",
+       subtitle = "Serie mensual 2010–2026",
+       x = NULL, y = "Pesos por día") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p2 <- ggplot(df_plot, aes(x = fecha, y = inflacion)) +
+  geom_line(color = "#cb181d", linewidth = 0.9) +
+  geom_area(fill = "#cb181d", alpha = 0.1) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Inflación en Alimentos en México",
+       subtitle = "Subíndice INPC — Serie mensual 2010–2026",
+       x = NULL, y = "Variación (%)") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p1, p2, ncol = 1)
+```
+
+## Transformación Logarítmica
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+log_salario_ts   <- log(salario_ts)
+log_inflacion_ts <- log(inflacion_ts)
+
+df_log <- data.frame(
+  fecha    = datos$fecha,
+  log_sal  = as.numeric(log_salario_ts),
+  log_inf  = as.numeric(log_inflacion_ts)
+)
+
+p3 <- ggplot(df_log, aes(x = fecha, y = log_sal)) +
+  geom_line(color = "#2171b5", linewidth = 0.9) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Log(Salario Mínimo)",
+       x = NULL, y = "Log") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p4 <- ggplot(df_log, aes(x = fecha, y = log_inf)) +
+  geom_line(color = "#cb181d", linewidth = 0.9) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Log(Inflación en Alimentos)",
+       x = NULL, y = "Log") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p3, p4, ncol = 2)
+```
+
+## Análisis de Raíces Unitarias — Prueba ADF
+
+H₀: la serie tiene raíz unitaria (no es estacionaria).
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+cat("=== ADF: Log(Salario Mínimo) en niveles ===\n")
+adf.test(na.omit(log_salario_ts))
+
+cat("\n=== ADF: Log(Inflación Alimentos) en niveles ===\n")
+adf.test(na.omit(log_inflacion_ts))
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Primera diferencia
+diff_log_salario_ts   <- diff(log_salario_ts)
+diff_log_inflacion_ts <- diff(log_inflacion_ts)
+
+cat("=== ADF: Diff(Log(Salario)) ===\n")
+adf.test(na.omit(diff_log_salario_ts))
+
+cat("\n=== ADF: Diff(Log(Inflación Alimentos)) ===\n")
+adf.test(na.omit(diff_log_inflacion_ts))
+
+# Gráficas de series diferenciadas
+df_diff <- data.frame(
+  fecha   = datos$fecha[-1],
+  d_sal   = as.numeric(diff_log_salario_ts),
+  d_inf   = as.numeric(diff_log_inflacion_ts)
+)
+
+p5 <- ggplot(df_diff, aes(x = fecha, y = d_sal)) +
+  geom_line(color = "#2171b5", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Diff(Log(Salario Mínimo))",
+       subtitle = "Serie estacionaria",
+       x = NULL, y = "Cambio") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p6 <- ggplot(df_diff, aes(x = fecha, y = d_inf)) +
+  geom_line(color = "#cb181d", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Diff(Log(Inflación Alimentos))",
+       subtitle = "Serie estacionaria",
+       x = NULL, y = "Cambio") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p5, p6, ncol = 2)
+```
+
+## Prueba de Zivot-Andrews
+
+Detecta raíces unitarias en presencia de un quiebre estructural desconocido. Relevante porque en 2019 iniciaron los mega-aumentos al salario mínimo y en 2020 la pandemia generó un choque adicional.
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+cat("=== Zivot-Andrews: Log(Salario Mínimo) ===\n")
+za_salario <- ur.za(na.omit(log_salario_ts), model = "both", lag = 12)
+summary(za_salario)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+cat("=== Zivot-Andrews: Log(Inflación Alimentos) ===\n")
+za_inflacion <- ur.za(na.omit(log_inflacion_ts), model = "both", lag = 12)
+summary(za_inflacion)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Gráficas Zivot-Andrews
+par(mfrow = c(1, 2),
+    mar   = c(4, 4, 3, 1),
+    bg    = "white")
+
+plot(za_salario)
+title("Zivot-Andrews\nLog(Salario Minimo)")
+
+plot(za_inflacion)
+title("Zivot-Andrews\nLog(Inflación Alimentos)")
+
+par(mfrow = c(1, 1))
+```
+
+## ACF y PACF de las Series Diferenciadas
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+par(mfrow = c(2, 2),
+    mar   = c(4, 4, 3, 1),
+    bg    = "white")
+
+acf(na.omit(diff_log_salario_ts),
+    lag.max = 24,
+    main    = "ACF — Diff(Log(Salario))",
+    col     = "steelblue", lwd = 2)
+
+pacf(na.omit(diff_log_salario_ts),
+     lag.max = 24,
+     main    = "PACF — Diff(Log(Salario))",
+     col     = "steelblue", lwd = 2)
+
+acf(na.omit(diff_log_inflacion_ts),
+    lag.max = 24,
+    main    = "ACF — Diff(Log(Inflación))",
+    col     = "tomato", lwd = 2)
+
+pacf(na.omit(diff_log_inflacion_ts),
+     lag.max = 24,
+     main    = "PACF — Diff(Log(Inflación))",
+     col     = "tomato", lwd = 2)
+
+par(mfrow = c(1, 1))
+```
+
+## Causalidad de Granger y Selección de Rezagos VAR
+
+H₀: X no causa (en el sentido de Granger) a Y.
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Matriz bivariada con series estacionarias
+series_diff <- na.omit(cbind(diff_log_salario_ts, diff_log_inflacion_ts))
+colnames(series_diff) <- c("salario", "inflacion")
+
+# Selección de rezagos óptimos
+lag_sel <- VARselect(series_diff, lag.max = 12, type = "const")
+cat("Rezagos óptimos por criterio de información:\n")
+print(lag_sel$selection)
+
+p_opt <- lag_sel$selection["AIC(n)"]
+cat("\nRezago seleccionado (AIC):", p_opt, "\n")
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+cat("=== Granger: ¿Salario causa Inflación? ===\n")
+grangertest(inflacion ~ salario,
+            data  = as.data.frame(series_diff),
+            order = p_opt)
+
+cat("\n=== Granger: ¿Inflación causa Salario? ===\n")
+grangertest(salario ~ inflacion,
+            data  = as.data.frame(series_diff),
+            order = p_opt)
+```
+
+## Modelo VAR
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+modelo_var <- VAR(series_diff, p = p_opt, type = "const")
+summary(modelo_var)
+```
+
+## Diagnóstico del VAR
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Autocorrelación serial en residuos
+cat("=== Prueba de Portmanteau (autocorrelación serial) ===\n")
+serial_test <- serial.test(modelo_var, lags.pt = 12, type = "PT.asymptotic")
+print(serial_test)
+
+# Normalidad de residuos
+cat("\n=== Prueba de Normalidad de Residuos ===\n")
+norm_test <- normality.test(modelo_var)
+print(norm_test)
+```
+
+## Análisis de Impulso-Respuesta
+
+¿Cuánto y durante cuántos meses se transmite un choque en el salario mínimo hacia la inflación en alimentos?
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Choque en salario → respuesta en inflación
+irf_sal_inf <- irf(modelo_var,
+                   impulse  = "salario",
+                   response = "inflacion",
+                   n.ahead  = 24,
+                   boot     = TRUE,
+                   ci       = 0.95)
+
+par(mar = c(4, 4, 3, 1), bg = "white")
+plot(irf_sal_inf,
+     main = "Impulso (Salario Mínimo) → Respuesta (Inflación Alimentos)",
+     col  = "tomato", lwd = 2)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Choque en inflación → respuesta en salario
+irf_inf_sal <- irf(modelo_var,
+                   impulse  = "inflacion",
+                   response = "salario",
+                   n.ahead  = 24,
+                   boot     = TRUE,
+                   ci       = 0.95)
+
+par(mar = c(4, 4, 3, 1), bg = "white")
+plot(irf_inf_sal,
+     main = "Impulso (Inflación Alimentos) → Respuesta (Salario Mínimo)",
+     col  = "steelblue", lwd = 2)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Descomposición de varianza del error de pronóstico
+fevd_result <- fevd(modelo_var, n.ahead = 24)
+
+par(mar = c(4, 4, 3, 1), bg = "white")
+plot(fevd_result,
+     main = "Descomposición de Varianza (FEVD)")
+```
+
+## Modelo ARCH/GARCH — Volatilidad de la Inflación en Alimentos
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Residuos de la ecuación de inflación del VAR
+residuos_inf <- residuals(modelo_var)[, "inflacion"]
+
+# Prueba de efectos ARCH
+cat("=== Prueba de Efectos ARCH (H0: no hay efectos ARCH) ===\n")
+arch_test <- ArchTest(residuos_inf, lags = 12)
+print(arch_test)
+
+# Gráfica de residuos al cuadrado
+df_res <- data.frame(
+  t        = seq_along(residuos_inf),
+  residuos = residuos_inf,
+  res2     = residuos_inf^2
+)
+
+p7 <- ggplot(df_res, aes(x = t, y = residuos)) +
+  geom_line(color = "#cb181d", linewidth = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(title = "Residuos — Ecuación de Inflación (VAR)",
+       x = "Observación", y = "Residuo") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+p8 <- ggplot(df_res, aes(x = t, y = res2)) +
+  geom_line(color = "darkorange", linewidth = 0.7) +
+  labs(title = "Residuos al Cuadrado — Evidencia de Heterocedasticidad",
+       x = "Observación", y = "Residuo²") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+grid.arrange(p7, p8, ncol = 1)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Especificación GARCH(1,1)
+spec_garch <- ugarchspec(
+  variance.model     = list(model = "sGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(1, 0), include.mean = TRUE),
+  distribution.model = "norm"
+)
+
+# Estimación con la serie diferenciada de inflación
+modelo_garch <- ugarchfit(
+  spec   = spec_garch,
+  data   = na.omit(diff_log_inflacion_ts),
+  solver = "hybrid"
+)
+
+show(modelo_garch)
+```
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Volatilidad condicional estimada
+vol_cond <- as.numeric(sigma(modelo_garch))
+fechas_garch <- datos$fecha[-1][!is.na(diff_log_inflacion_ts)]
+fechas_garch <- fechas_garch[seq_along(vol_cond)]
+
+df_vol <- data.frame(fecha = fechas_garch, volatilidad = vol_cond)
+
+ggplot(df_vol, aes(x = fecha, y = volatilidad)) +
+  geom_line(color = "darkorange", linewidth = 0.9) +
+  geom_area(fill = "darkorange", alpha = 0.15) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y") +
+  labs(title = "Volatilidad Condicional Estimada — GARCH(1,1)",
+       subtitle = "Inflación en Alimentos (2010–2026)",
+       x = NULL, y = "Desviación estándar condicional") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Pronóstico de Volatilidad a 12 Meses
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+pronostico_garch <- ugarchforecast(modelo_garch, n.ahead = 12)
+
+vol_f   <- as.numeric(sigma(pronostico_garch))
+media_f <- as.numeric(fitted(pronostico_garch))
+
+df_fc <- data.frame(
+  mes        = 1:12,
+  volatilidad = vol_f,
+  media       = media_f
+)
+
+ggplot(df_fc, aes(x = mes)) +
+  geom_ribbon(aes(ymin = media - 1.96 * volatilidad,
+                  ymax = media + 1.96 * volatilidad),
+              fill = "darkorange", alpha = 0.2) +
+  geom_line(aes(y = media), color = "darkorange",
+            linewidth = 1, linetype = "dashed") +
+  geom_line(aes(y = volatilidad), color = "tomato", linewidth = 1) +
+  scale_x_continuous(breaks = 1:12,
+                     labels = paste0("M+", 1:12)) +
+  labs(title = "Pronóstico GARCH(1,1) — Próximos 12 Meses",
+       subtitle = "Línea roja: volatilidad | Banda naranja: intervalo de confianza 95%",
+       x = "Horizonte", y = "Valor") +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+## Diagnóstico Final del GARCH
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1), bg = "white")
+plot(modelo_garch, which = 8)   # ACF residuos estandarizados
+plot(modelo_garch, which = 9)   # ACF residuos estandarizados al cuadrado
+plot(modelo_garch, which = 11)  # QQ-plot
+par(mfrow = c(1, 1))
+```
